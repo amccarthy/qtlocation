@@ -60,6 +60,17 @@ This package contains the polling positioning plugin. It provides the
 generic polling based area monitor.
 
 
+%package -n qt5-plugin-position-geoclue
+Summary:    Qt Positioning plugin for Geoclue
+Group:      Qt/Qt
+Requires:   qt5-qtpositioning = %{version}-%{release}
+Obsoletes:  qt5-qtlocation-plugin-position-geoclue <= 5.1.0+git7
+Provides:   qt5-qtlocation-plugin-position-geoclue > 5.1.0+git7
+
+%description -n qt5-plugin-position-geoclue
+This package contains the geoclue positioning plugin.
+
+
 %package -n qt5-qtdeclarative-import-positioning
 Summary:    QtDeclarative positioning import
 Group:      Qt/Qt
@@ -185,6 +196,10 @@ find %{buildroot}%{_libdir} -type f -name '*.prl' \
 %files -n qt5-plugin-position-poll
 %defattr(-,root,root,-)
 %{_libdir}/qt5/plugins/position/*positionpoll*
+
+%files -n qt5-plugin-position-geoclue
+%defattr(-,root,root,-)
+%{_libdir}/qt5/plugins/position/*geoclue*
 
 %files -n qt5-qtdeclarative-import-positioning
 %defattr(-,root,root,-)
