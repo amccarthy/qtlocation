@@ -41,122 +41,22 @@
 
 #include "qgeosatelliteinfosource_geocluemaster.h"
 
-#include <QtDBus/QDBusConnection>
-#include <QtDBus/QDBusMessage>
-#include <QtDBus/QDBusArgument>
+#include <geoclue_interface.h>
+#include <satellite_interface.h>
+
+#include <QtDBus/QDBusPendingCallWatcher>
 
 #define MINIMUM_UPDATE_INTERVAL 1000
 
 QT_BEGIN_NAMESPACE
 
-namespace
-{
-
-void satellite_changed(GeoclueSatellite *satellite, int timestamp, int satellite_used,
-                       int satellite_visible, GArray *used_prn, GPtrArray *sat_info,
-                       gpointer userdata)
-{
-    Q_UNUSED(satellite)
-
-    QGeoSatelliteInfoSourceGeoclueMaster *source =
-        static_cast<QGeoSatelliteInfoSourceGeoclueMaster *>(userdata);
-
-    QList<int> usedPrns;
-    for (unsigned int i = 0; i < used_prn->len; ++i)
-        usedPrns.append(g_array_index(used_prn, int, i));
-
-    QList<QGeoSatelliteInfo> satInfos;
-    for (unsigned int i = 0; i < sat_info->len; ++i) {
-        GValueArray *a = static_cast<GValueArray *>(g_ptr_array_index(sat_info, i));
-
-        QGeoSatelliteInfo satInfo;
-
-        satInfo.setSatelliteIdentifier(g_value_get_int(g_value_array_get_nth(a, 0)));
-        satInfo.setAttribute(QGeoSatelliteInfo::Elevation,
-                             g_value_get_int(g_value_array_get_nth(a, 1)));
-        satInfo.setAttribute(QGeoSatelliteInfo::Azimuth,
-                             g_value_get_int(g_value_array_get_nth(a, 2)));
-        satInfo.setSignalStrength(g_value_get_int(g_value_array_get_nth(a, 3)));
-
-        satInfos.append(satInfo);
-    }
-
-    source->satelliteChanged(timestamp, satellite_used, satellite_visible, usedPrns, satInfos);
-}
-
-void satellite_callback(GeoclueSatellite *satellite, int timestamp, int satellite_used,
-                        int satellite_visible, GArray *used_prn, GPtrArray *sat_info,
-                        GError *error, gpointer userdata)
-{
-    Q_UNUSED(satellite)
-
-    if (error)
-        g_error_free(error);
-
-    QGeoSatelliteInfoSourceGeoclueMaster *source =
-        static_cast<QGeoSatelliteInfoSourceGeoclueMaster *>(userdata);
-
-    QList<int> usedPrns;
-    for (unsigned int i = 0; i < used_prn->len; ++i)
-        usedPrns.append(g_array_index(used_prn, int, i));
-
-    QList<QGeoSatelliteInfo> satInfos;
-    for (unsigned int i = 0; i < sat_info->len; ++i) {
-        GValueArray *a = static_cast<GValueArray *>(g_ptr_array_index(sat_info, i));
-
-        QGeoSatelliteInfo satInfo;
-
-        satInfo.setSatelliteIdentifier(g_value_get_int(g_value_array_get_nth(a, 0)));
-        satInfo.setAttribute(QGeoSatelliteInfo::Elevation,
-                             g_value_get_int(g_value_array_get_nth(a, 1)));
-        satInfo.setAttribute(QGeoSatelliteInfo::Azimuth,
-                             g_value_get_int(g_value_array_get_nth(a, 2)));
-        satInfo.setSignalStrength(g_value_get_int(g_value_array_get_nth(a, 3)));
-
-        satInfos.append(satInfo);
-    }
-
-    source->requestUpdateFinished(timestamp, satellite_used, satellite_visible, usedPrns, satInfos);
-}
-
-}
-
-const QDBusArgument &operator>>(const QDBusArgument &argument, QGeoSatelliteInfo &si)
-{
-    int a;
-
-    argument.beginStructure();
-    argument >> a;
-    si.setSatelliteIdentifier(a);
-    argument >> a;
-    si.setAttribute(QGeoSatelliteInfo::Elevation, a);
-    argument >> a;
-    si.setAttribute(QGeoSatelliteInfo::Azimuth, a);
-    argument >> a;
-    si.setSignalStrength(a);
-    argument.endStructure();
-    return argument;
-}
-
-const QDBusArgument &operator>>(const QDBusArgument &argument, QList<QGeoSatelliteInfo> &sis)
-{
-    sis.clear();
-
-    argument.beginArray();
-    while (!argument.atEnd()) {
-        QGeoSatelliteInfo si;
-        argument >> si;
-        sis.append(si);
-    }
-    argument.endArray();
-
-    return argument;
-}
-
 QGeoSatelliteInfoSourceGeoclueMaster::QGeoSatelliteInfoSourceGeoclueMaster(QObject *parent)
-:   QGeoSatelliteInfoSource(parent), QGeoclueMaster(this), m_sat(0), m_error(NoError),
-    m_satellitesChangedConnected(false), m_running(false)
+:   QGeoSatelliteInfoSource(parent), m_master(new QGeoclueMaster(this)), m_provider(0), m_sat(0),
+    m_error(NoError), m_satellitesChangedConnected(false), m_running(false)
 {
+    connect(m_master, SIGNAL(positionProviderChanged(QString,QString,QString,QString)),
+            this, SLOT(positionProviderChanged(QString,QString,QString,QString)));
+
     m_requestTimer.setSingleShot(true);
     connect(&m_requestTimer, SIGNAL(timeout()), this, SLOT(requestUpdateTimeout()));
 }
@@ -164,13 +64,6 @@ QGeoSatelliteInfoSourceGeoclueMaster::QGeoSatelliteInfoSourceGeoclueMaster(QObje
 QGeoSatelliteInfoSourceGeoclueMaster::~QGeoSatelliteInfoSourceGeoclueMaster()
 {
     cleanupSatelliteSource();
-}
-
-bool QGeoSatelliteInfoSourceGeoclueMaster::init()
-{
-    g_type_init();
-
-    return true;
 }
 
 int QGeoSatelliteInfoSourceGeoclueMaster::minimumUpdateInterval() const
@@ -191,14 +84,8 @@ void QGeoSatelliteInfoSourceGeoclueMaster::startUpdates()
     m_running = true;
 
     // Start Geoclue provider.
-    if (!hasMasterClient())
+    if (!m_master->hasMasterClient())
         configureSatelliteSource();
-
-    // m_sat is likely to be invalid until Geoclue master selects a position provider.
-    if (!m_sat)
-        return;
-
-    g_signal_connect(G_OBJECT(m_sat), "satellite-changed", G_CALLBACK(satellite_changed), this);
 }
 
 void QGeoSatelliteInfoSourceGeoclueMaster::stopUpdates()
@@ -206,15 +93,17 @@ void QGeoSatelliteInfoSourceGeoclueMaster::stopUpdates()
     if (!m_running)
         return;
 
-    if (m_sat)
-        g_signal_handlers_disconnect_by_func(G_OBJECT(m_sat), gpointer(satellite_changed), this);
+    if (m_sat) {
+        disconnect(m_sat, SIGNAL(SatelliteChanged(qint32,qint32,qint32,QList<qint32>,QList<QGeoSatelliteInfo>)),
+                   this, SLOT(satelliteChanged(qint32,qint32,qint32,QList<qint32>,QList<QGeoSatelliteInfo>)));
+    }
 
     m_running = false;
 
     // Only stop positioning if single update not requested.
     if (!m_requestTimer.isActive()) {
         cleanupSatelliteSource();
-        releaseMasterClient();
+        m_master->releaseMasterClient();
     }
 }
 
@@ -228,19 +117,24 @@ void QGeoSatelliteInfoSourceGeoclueMaster::requestUpdate(int timeout)
     if (m_requestTimer.isActive())
         return;
 
-    if (!hasMasterClient())
+    if (!m_master->hasMasterClient())
         configureSatelliteSource();
 
     m_requestTimer.start(qMax(timeout, minimumUpdateInterval()));
 
-    if (m_sat)
-        geoclue_satellite_get_satellite_async(m_sat, satellite_callback, this);
+    if (m_sat) {
+        QDBusPendingReply<qint32, qint32, qint32, QList<qint32>, QList<QGeoSatelliteInfo> > reply =
+            m_sat->GetSatellite();
+        QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(reply, this);
+        connect(watcher, SIGNAL(finished(QDBusPendingCallWatcher*)),
+                this, SLOT(getSatelliteFinished(QDBusPendingCallWatcher*)));
+    }
 }
 
-void QGeoSatelliteInfoSourceGeoclueMaster::satelliteChanged(int timestamp, int satellitesUsed,
-                                                            int satellitesVisible,
-                                                            const QList<int> &usedPrn,
-                                                            const QList<QGeoSatelliteInfo> &satInfos)
+void QGeoSatelliteInfoSourceGeoclueMaster::updateSatelliteInfo(int timestamp, int satellitesUsed,
+                                                               int satellitesVisible,
+                                                               const QList<int> &usedPrn,
+                                                               const QList<QGeoSatelliteInfo> &satInfos)
 {
     Q_UNUSED(timestamp)
 
@@ -269,15 +163,6 @@ void QGeoSatelliteInfoSourceGeoclueMaster::satelliteChanged(int timestamp, int s
     emit satellitesInUseUpdated(m_inUse);
 }
 
-void QGeoSatelliteInfoSourceGeoclueMaster::requestUpdateFinished(int timestamp, int satellitesUsed,
-                                                                 int satellitesVisible,
-                                                                 const QList<int> &usedPrn,
-                                                                 const QList<QGeoSatelliteInfo> &satInfos)
-{
-    m_requestTimer.stop();
-    satelliteChanged(timestamp, satellitesUsed, satellitesVisible, usedPrn, satInfos);
-}
-
 void QGeoSatelliteInfoSourceGeoclueMaster::requestUpdateTimeout()
 {
     // If we end up here, there has not been a valid satellite info update.
@@ -286,17 +171,40 @@ void QGeoSatelliteInfoSourceGeoclueMaster::requestUpdateTimeout()
     // Only stop satellite info if regular updates not active.
     if (!m_running) {
         cleanupSatelliteSource();
-        releaseMasterClient();
+        m_master->releaseMasterClient();
     }
 }
 
-void QGeoSatelliteInfoSourceGeoclueMaster::positionProviderChanged(const QByteArray &service, const QByteArray &path)
+void QGeoSatelliteInfoSourceGeoclueMaster::getSatelliteFinished(QDBusPendingCallWatcher *watcher)
 {
-    if (m_sat)
-        cleanupSatelliteSource();
+    QDBusPendingReply<qint32, qint32, qint32, QList<qint32>, QList<QGeoSatelliteInfo> > reply = *watcher;
+    watcher->deleteLater();
 
-    QByteArray providerService;
-    QByteArray providerPath;
+    if (reply.isError())
+        return;
+
+    m_requestTimer.stop();
+    updateSatelliteInfo(reply.argumentAt<0>(), reply.argumentAt<1>(), reply.argumentAt<2>(),
+                        reply.argumentAt<3>(), reply.argumentAt<4>());
+}
+
+void QGeoSatelliteInfoSourceGeoclueMaster::satelliteChanged(int timestamp, int satellitesUsed, int satellitesVisible, const QList<int> &usedPrn, const QList<QGeoSatelliteInfo> &satInfos)
+{
+    updateSatelliteInfo(timestamp, satellitesUsed, satellitesVisible, usedPrn, satInfos);
+}
+
+void QGeoSatelliteInfoSourceGeoclueMaster::positionProviderChanged(const QString &name,
+                                                                   const QString &description,
+                                                                   const QString &service,
+                                                                   const QString &path)
+{
+    Q_UNUSED(name)
+    Q_UNUSED(description)
+
+    cleanupSatelliteSource();
+
+    QString providerService;
+    QString providerPath;
 
     if (service.isEmpty() || path.isEmpty()) {
         // No valid position provider has been selected. This probably means that the GPS provider
@@ -305,7 +213,7 @@ void QGeoSatelliteInfoSourceGeoclueMaster::positionProviderChanged(const QByteAr
             QDBusConnection conn = QDBusConnection::sessionBus();
             conn.connect(QString(), QString(), QStringLiteral("org.freedesktop.Geoclue.Satellite"),
                          QStringLiteral("SatelliteChanged"), this,
-                         SLOT(satellitesChanged(QDBusMessage)));
+                         SLOT(satelliteChanged(QDBusMessage)));
             m_satellitesChangedConnected = true;
             return;
         }
@@ -315,7 +223,7 @@ void QGeoSatelliteInfoSourceGeoclueMaster::positionProviderChanged(const QByteAr
             conn.disconnect(QString(), QString(),
                             QStringLiteral("org.freedesktop.Geoclue.Satellite"),
                             QStringLiteral("SatelliteChanged"), this,
-                            SLOT(satellitesChanged(QDBusMessage)));
+                            SLOT(satelliteChanged(QDBusMessage)));
             m_satellitesChangedConnected = false;
         }
 
@@ -329,17 +237,18 @@ void QGeoSatelliteInfoSourceGeoclueMaster::positionProviderChanged(const QByteAr
         return;
     }
 
-    m_sat = geoclue_satellite_new(providerService.constData(), providerPath.constData());
-    if (!m_sat) {
-        m_error = AccessError;
-        emit QGeoSatelliteInfoSource::error(m_error);
-        return;
-    }
+    m_provider = new OrgFreedesktopGeoclueInterface(providerService, providerPath, QDBusConnection::sessionBus());
+    m_provider->AddReference();
 
-    g_signal_connect(G_OBJECT(m_sat), "satellite-changed", G_CALLBACK(satellite_changed), this);
+    m_sat = new OrgFreedesktopGeoclueSatelliteInterface(providerService, providerPath, QDBusConnection::sessionBus());
+
+    if (m_running) {
+        connect(m_sat, SIGNAL(SatelliteChanged(qint32,qint32,qint32,QList<qint32>,QList<QGeoSatelliteInfo>)),
+                this, SLOT(satelliteChanged(qint32,qint32,qint32,QList<qint32>,QList<QGeoSatelliteInfo>)));
+    }
 }
 
-void QGeoSatelliteInfoSourceGeoclueMaster::satellitesChanged(const QDBusMessage &message)
+void QGeoSatelliteInfoSourceGeoclueMaster::satelliteChanged(const QDBusMessage &message)
 {
     QVariantList arguments = message.arguments();
     if (arguments.length() != 5)
@@ -364,15 +273,19 @@ void QGeoSatelliteInfoSourceGeoclueMaster::satellitesChanged(const QDBusMessage 
 
 bool QGeoSatelliteInfoSourceGeoclueMaster::configureSatelliteSource()
 {
-    return createMasterClient(GEOCLUE_ACCURACY_LEVEL_DETAILED, GEOCLUE_RESOURCE_GPS);
+    return m_master->createMasterClient(Accuracy::Detailed, QGeoclueMaster::ResourceGps);
 }
 
 void QGeoSatelliteInfoSourceGeoclueMaster::cleanupSatelliteSource()
 {
-    if (m_sat) {
-        g_object_unref(m_sat);
-        m_sat = 0;
-    }
+    if (m_provider)
+        m_provider->RemoveReference();
+    delete m_provider;
+    m_provider = 0;
+    delete m_sat;
+    m_sat = 0;
 }
+
+#include "moc_qgeosatelliteinfosource_geocluemaster.cpp"
 
 QT_END_NAMESPACE
