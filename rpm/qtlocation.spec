@@ -16,6 +16,7 @@ BuildRequires:  qt5-qtopengl
 BuildRequires:  qt5-qtopengl-devel
 BuildRequires:  qt5-qtnetwork
 BuildRequires:  qt5-qtnetwork-devel
+BuildRequires:  qt5-qtdbus-devel
 BuildRequires:  qt5-qtdeclarative-devel
 BuildRequires:  qt5-qtdeclarative-qtquick-devel
 BuildRequires:  qt5-qmake
